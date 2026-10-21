@@ -1,0 +1,6 @@
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+chromadb==1.5.9
+ollama==0.6.3
+openai==3.26.1
