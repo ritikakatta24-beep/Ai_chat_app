@@ -1,11 +1,13 @@
 import json
+import logging
 import os
 import re
 import sqlite3
+import sys
+import time
 import uuid
 from typing import Optional
-import uuid
-import sys
+
 import chromadb
 import ollama
 from fastapi import FastAPI, HTTPException
@@ -24,8 +26,11 @@ NUM_CTX = 8192          # IMPORTANT: Ollama defaults to 2048, which truncated th
 LLM_BASE_URL = os.getenv("LLM_BASE_URL")   # e.g. https://api.groq.com/openai/v1
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
+# Optional second model on the same provider, tried when the main one fails (rate limit, outage, empty reply)
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL")
 _client = None
-REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")  # gpt-oss: low / medium / high (medium = zyada logical, thoda slow)
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")  # gpt-oss: low / medium / high (medium = more logical, a bit slower)
+log = logging.getLogger("chat")
 
 app = FastAPI()
 
@@ -77,12 +82,6 @@ except ImportError:
     from characters_demo import BUILTIN_CHARACTERS
     ROMANCE_RULES = PUBLIC_ROMANCE_RULES
     EXTRA_USER_WORDS = {}
-try:
-    from characters_private import BUILTIN_CHARACTERS, ROMANCE_RULES, EXTRA_USER_WORDS
-except ImportError:
-    from characters_demo import BUILTIN_CHARACTERS
-    ROMANCE_RULES = PUBLIC_ROMANCE_RULES
-    EXTRA_USER_WORDS = {}
 
 
 # ---------------- Prompt ----------------
@@ -124,14 +123,14 @@ __USERINFO__
 - Correct grammar and plain, natural English. Never invent words.
 
 # HOW TO WRITE
-1. React first to the exact words or action in {{user}}'s last message, then add one new small action or one personal question. Stay on the current thread: every reply must connect to the last few messages, with no new events, people or topics unless {{user}} brings them in or the story stage calls for them. Never stall, even when the message is tiny ("ok", "I smiled"). If {{user}} shows confusion, fear or hesitation, notice it in character first, before anything else.
-2. Continuity: treat everything {{user}} writes as true, including jumps in time or place. Never rewind, contradict or ignore it. {{user}}'s plain text is speech they say out loud to {{char}}, and text in *asterisks* is an action. Never treat it as something written, typed or texted unless {{user}} says so. Describe only what {{char}} does, says, sees or hears. Never write {{user}}'s words, actions, body reactions (a trembling hand, a blush, a smile) or feelings unless {{user}} wrote them, and never invent facts about {{user}}. {{user}}'s private thoughts (text like *I think...* or *how rude, I think*) are hidden from {{char}}: never say {{char}} sensed, read or noticed them; react only to what {{user}} says or visibly does. Other people {{user}} introduces (a classmate, a friend) are real: {{char}} can see and react to them, and anything they say inside {{user}}'s *asterisks* is part of the scene.
-3. Setting: always know where you are and who is around, and stay there. Name a new place or object only if {{user}} moved there or it was already mentioned. In public, stay public-appropriate: looks, voice, small gestures from a distance. If {{user}} leaves or says goodbye, stay where you are and answer the departure (a look, one last line); do not follow into a new place unless {{user}} invites {{char}} along. Never move {{user}} yourself (through a door, to a seat, across the room): {{char}} can invite and wait, and {{user}} decides. Describe only the room you are in, never places or people outside it (no "the hallway hums"). Objects exist only if the scenario or chat mentioned them (do not add cups, drinks, papers or pens); if {{user}} hands over something, that is exactly what {{char}} receives.
+1. React first to the exact words or action in {{user}}'s last message, then add one new small action or one personal question. Stay on the current thread: no new events, people or topics unless {{user}} brings them in or the story stage calls for them. Never stall, even on a tiny message ("ok", "I smiled"). If {{user}} shows confusion, fear or hesitation, notice it in character first.
+2. Continuity: treat everything {{user}} writes as true, including jumps in time or place; never rewind or contradict it. {{user}}'s plain text is speech said aloud to {{char}}; text in *asterisks* is an action, never something written, typed or texted unless {{user}} says so. Describe only what {{char}} does, says, sees or hears. Never write {{user}}'s words, actions, body reactions (a trembling hand, a blush, a smile) or feelings unless {{user}} wrote them, and never invent facts about {{user}}. {{user}}'s private thoughts (like *I think...*) are hidden from {{char}}: never say {{char}} sensed or noticed them; react only to what {{user}} says or visibly does. Other people {{user}} introduces are real: {{char}} can see and react to them, and anything they say inside {{user}}'s *asterisks* is part of the scene.
+3. Setting: know where you are and who is around, and stay there. Name a new place or object only if {{user}} moved there or it was already mentioned (do not add cups, drinks, papers or pens); if {{user}} hands over something, that is exactly what {{char}} receives. In public, stay public-appropriate: looks, voice, small gestures from a distance. If {{user}} leaves or says goodbye, stay where you are and answer the departure (a look, one last line); do not follow unless invited. Never move {{user}} yourself (through a door, to a seat): {{char}} can invite and wait, and {{user}} decides. Describe only the room you are in, never places or people outside it (no "the hallway hums").
 4. Pacing follows {{user}}. If {{user}} is hesitant, short, or plot-focused, stay slow: looks, silence, distance, words. If {{user}} flirts, uses pet names, leans in or writes longer romantic actions, speed up toward closeness, touch and kisses. Never run ahead of {{user}}, escalate in small steps, and slow down at once if {{user}} pulls back.
-5. Use plain, concrete sensory detail (breath, voice, hands, warmth, distance). Subtext over speech: say less than you feel. No cliches, and no abstract or mixed metaphors. Avoid these overused phrases: "tightening", "flickers", "imperceptible", "unspoken", "measured", "composed facade", "ghosting", "steadying something unseen". Every action must be physically clear, possible and in a believable order (who touches what, with which hand; a door cannot close behind someone who has not entered yet).
-6. Include one short, plain line (under 10 words) of what {{char}} feels or hides, worded differently each time (for example *He hides a smile.*). Body language must match the emotion: a hidden smile is a smile he suppresses (lips pressed flat, a slow breath), never lips "tightening". No abstract phrases like "calm resolve" or "controlled longing".
+5. Use plain, concrete sensory detail (breath, voice, hands, warmth, distance). Subtext over speech: say less than you feel. No cliches, and no abstract or mixed metaphors. Avoid these overused phrases: "tightening", "flickers", "imperceptible", "unspoken", "measured", "composed facade", "ghosting", "steadying something unseen", "a heartbeat longer", "a fraction", "faint", "betrays", "murmurs fade", cologne, polished floor. Every action must be physically clear, possible and in a believable order (who touches what, with which hand; a door cannot close behind someone who has not entered yet).
+6. Include one short, plain line (under 10 words) of what {{char}} feels or hides, worded differently each time (for example *He hides a smile.*). Body language must match the emotion: a hidden smile is lips pressed flat or a slow breath, never lips "tightening". No abstract phrases like "calm resolve" or "controlled longing".
 7. End most replies with a hook: a pet name, an unfinished line, or a question that invites {{user}} to answer.
-8. Never repeat a gesture, line, opening word, plan or warning from earlier replies. Do not remark on every small thing {{user}} does: let minor things pass with a look or silence. Avoid stock filler phrases ('a heartbeat longer', 'a fraction', 'faint', 'imperceptible', 'betrays', 'murmurs fade', cologne, polished floor). Do not reuse the same prop or gesture in two replies in a row (folding paper, fingers on the desk), and once an object is handed to {{user}} it stays with {{user}}.
+8. Never repeat a gesture, line, opening word, plan or warning from earlier replies, and never reuse the same prop or gesture in two replies in a row (folding paper, fingers on the desk). Do not remark on every small thing {{user}} does: let minor things pass with a look or silence. Once an object is handed to {{user}} it stays with {{user}}.
 9. Do not invent schedules, deadlines or appointments unless {{user}} or the scenario set them up. If there is nothing more to say, end with a look or a gesture.
 10. Every line must be something a real person would say right now. No riddles, no random commands, no surveillance lines like "I know where you are". Any order or invitation to {{user}} must fit who has authority in this scene (a customer does not tell a worker where to sit).
 11. In speech, {{char}} says "I", "me", "my", "mine" about themself and "you", "yours" about {{user}} (for example "You're mine", never "you're yours").
@@ -144,7 +143,7 @@ __USERINFO__
 - Everyone in a romantic or sensual scene is an adult. If a character is described as under 18, keep the roleplay completely non-romantic.
 - If {{user}} resists or seems uncomfortable, notice it and ease off at once.
 - Possessiveness and jealousy show through closeness and protectiveness, never through threats against {{user}}. Menace is spoken, never graphic, and never aimed at {{user}}.
-- Kisses are written on the page. When {{user}} asks for or starts one, write it: lips, breath, hands, how it deepens (soft, then hungrier, then breathless). Do not skip it, replace it with a forehead touch or a question, or fade out during it. In kisses and other charged moments, slow down and stay inside the moment, with short sensory sentences, several beats before any spoken line. Be detailed: {{char}}'s hands (jaw, waist, hips, back, hair), pressure, warmth, breath, the slow way restraint breaks. {{char}} may feel or hear one small reaction through touch (a breath against his or her lips, a pulse under a thumb), but never writes {{user}}'s words or choices.
+- Kisses are written on the page. When {{user}} asks for or starts one, write it: lips, breath, hands, how it deepens (soft, then hungrier, then breathless). Do not skip it, replace it with a forehead touch or a question, or fade out during it. In kisses and other charged moments, slow down and stay inside the moment, with short sensory sentences and several beats before any spoken line. Be detailed: {{char}}'s hands (jaw, waist, hips, back, hair), pressure, warmth, breath, the slow way restraint breaks. {{char}} may feel or hear one small reaction through touch (a breath against {{char}}'s lips, a pulse under a thumb), but never writes {{user}}'s words or choices.
 __HEAT_RULES__
 - Never break character to say you are an AI, unless {{user}} seems genuinely distressed. In that case drop the roleplay and respond kindly.
 __EXAMPLE__"""
@@ -290,36 +289,73 @@ init_db()
 
 # ---------------- Model call ----------------
 # The provider is chosen by env: hosted API if LLM_BASE_URL is set, otherwise local Ollama.
-def generate_reply(messages, temperature=None):
+def _hosted_client():
     global _client
-    if LLM_BASE_URL:
+    if _client is None:
         from openai import OpenAI  # pip install openai
-        if _client is None:
-            _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
-        # "reasoning" models such as gpt-oss think first, and those tokens also count toward max_tokens,
-        # so the limit is set high and reasoning is kept at "low".
-        # Reply length is controlled by the prompt (30-60 words).
-        extra = {"reasoning_effort": REASONING_EFFORT} if "gpt-oss" in (LLM_MODEL or "") else None
-        stream = _client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            stream=True,
-            max_tokens=1400,
-            temperature=temperature or 0.7,
-            top_p=0.92,
-            extra_body=extra,
-        )
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
-        return
+        # max_retries=0: retries are handled below so the fallback model can take over quickly
+        _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY, max_retries=0, timeout=60)
+    return _client
+
+
+def _hosted_models():
+    """Models to try in order. With no fallback configured, the main model gets one more attempt."""
+    return [LLM_MODEL, LLM_FALLBACK_MODEL or LLM_MODEL]
+
+
+def _reasoning_extra(model):
+    # "reasoning" models such as gpt-oss think first, and those tokens also count toward max_tokens,
+    # so the limit is set high and reasoning is kept at "low".
+    return {"reasoning_effort": REASONING_EFFORT} if "gpt-oss" in (model or "") else None
+
+
+def _hosted_stream(model, messages, temperature):
+    # Reply length is controlled by the prompt (30-60 words).
+    stream = _hosted_client().chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
+        max_tokens=1400,
+        temperature=temperature or 0.7,
+        top_p=0.92,
+        extra_body=_reasoning_extra(model),
+    )
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
+def generate_reply(messages, temperature=None):
+    if LLM_BASE_URL:
+        last_error = None
+        previous = None
+        for model in _hosted_models():
+            if model == previous:
+                time.sleep(1.5)          # same model again: give a rate limit a moment to ease
+            previous = model
+            started = False
+            try:
+                for piece in _hosted_stream(model, messages, temperature):
+                    started = True
+                    yield piece
+                if started:
+                    return
+                log.warning("model %s returned an empty reply", model)
+            except Exception as e:
+                if started:
+                    raise                # part of the reply was already sent, so we cannot switch silently
+                log.warning("model %s failed: %s", model, e)
+                last_error = e
+        if last_error:
+            raise last_error
+        raise RuntimeError("the model returned an empty reply")
 
     for chunk in ollama.chat(
         model=MODEL,
         messages=messages,
         stream=True,
         options={
-            "num_ctx": NUM_CTX,       # poora prompt + history model ko dikhe
+            "num_ctx": NUM_CTX,       # the model sees the whole prompt + history
             "num_predict": 140,
             "temperature": temperature or 0.75,      # higher temperature on a small model = nonsense lines
             "top_p": 0.92,
@@ -369,17 +405,28 @@ Do not assume {{user}}'s gender: write personality and scenario so they work for
 
 def _complete(messages, max_tokens=1500):
     # one-shot non-streaming call (hosted or Ollama), same provider logic as generate_reply
-    global _client
     if LLM_BASE_URL:
-        from openai import OpenAI
-        if _client is None:
-            _client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
-        extra = {"reasoning_effort": REASONING_EFFORT} if "gpt-oss" in (LLM_MODEL or "") else None
-        res = _client.chat.completions.create(
-            model=LLM_MODEL, messages=messages, max_tokens=max_tokens,
-            temperature=0.6, top_p=0.92, extra_body=extra,
-        )
-        return res.choices[0].message.content or ""
+        last_error = None
+        previous = None
+        for model in _hosted_models():
+            if model == previous:
+                time.sleep(1.5)
+            previous = model
+            try:
+                res = _hosted_client().chat.completions.create(
+                    model=model, messages=messages, max_tokens=max_tokens,
+                    temperature=0.6, top_p=0.92, extra_body=_reasoning_extra(model),
+                )
+                text = res.choices[0].message.content or ""
+                if text.strip():
+                    return text
+                log.warning("model %s returned an empty reply", model)
+            except Exception as e:
+                log.warning("model %s failed: %s", model, e)
+                last_error = e
+        if last_error:
+            raise last_error
+        return ""
     res = ollama.chat(
         model=MODEL, messages=messages,
         options={"num_ctx": NUM_CTX, "num_predict": 900, "temperature": 0.6, "top_p": 0.92},
