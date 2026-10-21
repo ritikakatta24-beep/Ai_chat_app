@@ -1,0 +1,12 @@
+# private content and local data
+characters_private.py
+app.db
+chroma_data/
+.env
+ 
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+ 
