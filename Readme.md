@@ -92,3 +92,83 @@ flowchart LR
 | LLM | Any OpenAI-compatible API (Groq, OpenRouter) through the `openai` client, or local Ollama |
 | Auth | PBKDF2-SHA256 password hashing, hashed session tokens, cookie-based session restore |
 | Hosting | Backend (FastAPI) on Render; the Streamlit front end runs locally and connects to the hosted API |
+
+## How it works
+
+### Prompt design
+Every chat starts from one structured system prompt built from the character card (description, personality, scenario, example dialogue) plus a fixed set of writing rules: formatting, reply length, continuity, setting, and how fast the story moves. Small details matter here:
+- **Reminder on the last message.** Small models follow the most recent instruction best, so a short reminder of the key rules is attached to the last user message on every request. It is never saved to the database.
+- **No lost context.** Ollama defaults to a 2,048-token window, which silently cut off the system prompt. The context size is set explicitly to 8,192.
+- **Gender-aware cards.** Character cards use placeholders such as `{{user}}`, `{{char}}` and pronoun tokens, so one card works for any user.
+
+### Pacing that follows the user
+Characters can define stages (for example reserved, then warming up, then close). The rules tell the model to move through them at the speed the user's tone sets, never to assume closeness the story hasn't built, and to slow down if the user pulls back. The built-in demo character, Nora Vale, shows the pattern.
+
+### Memory
+Recent messages go into the prompt directly. Older exchanges are embedded in ChromaDB and recalled by semantic search, but only those that fall outside the recent window, so the same text never appears twice. Recalled memories are added as "earlier in this chat" notes, with an instruction to treat them as true and not invent details.
+
+### Character auto-fill
+When a user creates a character with only a name and a short description, the LLM writes the missing sections once, at creation time rather than during chat. The output is validated before it is saved:
+- the example dialogue must match the expected format, or it is dropped
+- the first message must contain both narration and speech
+- if the wrong pronouns appear, it retries once, then falls back to safe defaults
+- anything the user wrote is never overwritten
+
+### Safety checks
+Characters are checked at creation and on every edit. Under-18 details are blocked by age validation and pattern matching across all fields. Real public figures are blocked by a name list plus an LLM check.
+
+### Reliability
+The LLM client tries a fallback model if the main one fails or returns nothing. If both fail, the user's message is removed from the database, so a retry doesn't create duplicates, and the user sees a short "model is busy" message.
+
+## Run it locally
+
+**Requirements:** Python 3.14 (the version this was developed and tested on), and either an API key for an OpenAI-compatible provider (such as Groq) or [Ollama](https://ollama.com) installed locally.
+
+```bash
+git clone https://github.com/ritikakatta24-beep/Ai_chat_app.git
+cd Ai_chat_app
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-frontend.txt
+```
+
+### 1. Start the backend
+
+**Option A: hosted model (Groq or any OpenAI-compatible API)**
+```bash
+export LLM_BASE_URL="https://api.groq.com/openai/v1"
+export LLM_API_KEY="your_api_key"
+export LLM_MODEL="your_main_model"
+export LLM_FALLBACK_MODEL="your_backup_model"   # optional
+uvicorn main:app --reload --port 8000
+```
+
+**Option B: local model with Ollama**
+```bash
+ollama pull qwen2.5:7b
+uvicorn main:app --reload --port 8000
+```
+Ollama is used automatically when `LLM_BASE_URL` is not set. Use `CHAT_MODEL` to pick a different Ollama model.
+
+### 2. Start the front end
+
+In a second terminal:
+```bash
+source venv/bin/activate
+API_URL=http://localhost:8000 streamlit run app.py
+```
+Open http://localhost:8501, create an account and start chatting. Without `API_URL`, the front end connects to the author's hosted demo backend.
+
+### Configuration
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Hosted OpenAI-compatible model | not set (uses Ollama) |
+| `LLM_FALLBACK_MODEL` | Second model tried if the first fails | not set |
+| `CHAT_MODEL` | Ollama model name | `qwen2.5:7b` |
+| `CONTEXT_MESSAGES` | Recent messages sent to the model | `20` (10 suggested on free tiers) |
+| `REASONING_EFFORT` | For gpt-oss models: low, medium or high | `low` |
+| `API_URL` | Backend address used by the front end | hosted demo URL |
+
+The SQLite database (`app.db`) and the ChromaDB folder (`chroma_data/`) are created automatically on first run. The first chat may be slow while ChromaDB downloads its embedding model.
