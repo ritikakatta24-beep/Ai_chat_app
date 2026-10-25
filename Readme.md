@@ -81,3 +81,14 @@ flowchart LR
 | SQLite (`app.db`) | Accounts, sessions, characters, chats, messages, character photos |
 | ChromaDB (`chroma_data/`) | Embeddings of past exchanges for long-term memory, filtered per chat |
 | Environment variables | LLM endpoint, API key, model names |
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Backend API | FastAPI, Uvicorn, Pydantic |
+| Front end | Streamlit with custom CSS, Pillow for photo processing |
+| Database | SQLite (accounts, sessions, characters, chats, messages, photos) |
+| Vector memory | ChromaDB |
+| LLM | Any OpenAI-compatible API (Groq, OpenRouter) through the `openai` client, or local Ollama |
+| Auth | PBKDF2-SHA256 password hashing, hashed session tokens, cookie-based session restore |
+| Hosting | Backend (FastAPI) on Render; the Streamlit front end runs locally and connects to the hosted API |
