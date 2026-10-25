@@ -226,3 +226,22 @@ Notes:
 - The app looks for `characters_private.py` and character photos in `/etc/secrets`, so private cards never need to be committed.
 - On Render's free plan the service sleeps when idle, so the first request after a pause can take a while. The Streamlit front end pings the backend at startup to wake it.
 - The free plan has no persistent disk, so `app.db` and `chroma_data/` reset when the service restarts. That is fine for a demo. For real use, move to a persistent disk or a hosted database.
+
+## Limitations and next steps
+
+**Known limitations**
+- Emails are not verified, and there is no password reset yet.
+- SQLite and ChromaDB live on local disk, so on Render's free plan all data resets when the service restarts.
+- Login lockout and signup rate limits are kept in memory. They reset on restart and are not shared between instances.
+- User-created characters are visible only to their creator, and starting a chat checks that the character exists but not who may use it.
+- Safety checks run on character cards when they are created or edited. Chat messages themselves are not moderated.
+- The Streamlit front end is run locally rather than hosted.
+
+
+**Next steps**
+- Email verification and password reset
+- Move to PostgreSQL and a persistent vector store
+- Add tests for auth, ownership checks and the prompt pipeline (pytest)
+- Let users publish characters for everyone, with proper visibility checks
+- Per-user rate limits on chat requests
+- Host the front end and add a CI pipeline
