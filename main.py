@@ -388,6 +388,12 @@ def init_db():
                      ("tagline", "TEXT NOT NULL DEFAULT ''"), ("tags", "TEXT NOT NULL DEFAULT ''")):
         if col not in char_cols:
             conn.execute(f"ALTER TABLE characters ADD COLUMN {col} {ddl}")
+    # older databases lack the email column on users; add it (existing accounts keep working with '')
+    user_cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "email" not in user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+    # one account per email (accounts without an email are ignored by the index)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email != ''")
     apply_card_extras(conn)
     conn.commit()
     conn.close()
@@ -738,6 +744,7 @@ def validate_character(name, description, first_message="", personality="", scen
 SESSION_DAYS = 14
 PBKDF2_ROUNDS = 240_000
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{1,29}$")   # 2-30 chars
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 MAX_FAILS, LOCK_SECONDS = 5, 300          # 5 wrong passwords -> locked for 5 minutes
 MAX_SIGNUPS_PER_HOUR = 10                 # per IP
 _fails = {}      # "user:alice" / "ip:1.2.3.4" -> failure timestamps (in memory, resets on restart)
@@ -802,18 +809,22 @@ def current_username(authorization: str = Header(default="")) -> str:
 
 
 class SignupBody(BaseModel):
+    email: str
     username: str
     password: str
     gender: str = ""     # "female" / "male" / "nonbinary" / "" (not given)
 
 
 class LoginBody(BaseModel):
-    username: str
+    email: str           # log in with email + password; the username comes back from the account
     password: str
 
 
 @app.post("/auth/signup")
 def signup(body: SignupBody, request: Request):
+    email = body.email.strip().lower()
+    if len(email) > 254 or not EMAIL_RE.match(email):
+        raise HTTPException(400, "Please enter a valid email address.")
     username = body.username.strip()
     if not USERNAME_RE.match(username):
         raise HTTPException(400, "Username must be 2-30 characters: letters, numbers, spaces, dot, dash or underscore.")
@@ -825,48 +836,56 @@ def signup(body: SignupBody, request: Request):
     gender = normalize_gender(body.gender)
     salt = secrets.token_bytes(16)
     conn = get_db()
+    # same email = same person: send them to log in instead of making a second account
+    if conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone():
+        conn.close()
+        raise HTTPException(409, "An account with this email already exists. Please log in instead.")
     try:
         conn.execute(
-            "INSERT INTO users (username, pw_salt, pw_hash, gender, created_at) VALUES (?, ?, ?, ?, ?)",
-            (username, salt, _hash_pw(body.password, salt), gender, time.time()),
+            "INSERT INTO users (username, email, pw_salt, pw_hash, gender, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (username, email, salt, _hash_pw(body.password, salt), gender, time.time()),
         )
         conn.commit()
     except sqlite3.IntegrityError:
+        # lost a race on the email, or the username is taken
+        taken_email = conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
         conn.close()
+        if taken_email:
+            raise HTTPException(409, "An account with this email already exists. Please log in instead.")
         raise HTTPException(409, "That username is already taken.")
     _signups.setdefault(ip, []).append(time.time())
     token = _issue_session(conn, username)
     conn.close()
-    return {"token": token, "username": username, "gender": gender}
+    return {"token": token, "username": username, "gender": gender, "email": email}
 
 
 @app.post("/auth/login")
 def login(body: LoginBody, request: Request):
-    username = body.username.strip()
-    keys = [f"user:{username.lower()}", f"ip:{_client_ip(request)}"]
+    ident = body.email.strip().lower()
+    keys = [f"user:{ident}", f"ip:{_client_ip(request)}"]
     if any(len(_recent(_fails, k, LOCK_SECONDS)) >= MAX_FAILS for k in keys):
         raise HTTPException(429, "Too many failed attempts. Please wait a few minutes and try again.")
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    # hash even when the user does not exist, so timing does not reveal which usernames are real
+    row = conn.execute("SELECT * FROM users WHERE email = ? AND email != ''", (ident,)).fetchone()
+    # hash even when the user does not exist, so timing does not reveal which accounts are real
     candidate = _hash_pw(body.password[:128], row["pw_salt"] if row else b"0" * 16)
     if not row or not hmac.compare_digest(candidate, row["pw_hash"]):
         conn.close()
         for k in keys:
             _fails.setdefault(k, []).append(time.time())
-        raise HTTPException(401, "Incorrect username or password.")
+        raise HTTPException(401, "Incorrect email or password.")
     _fails.pop(keys[0], None)
     token = _issue_session(conn, row["username"])
     conn.close()
-    return {"token": token, "username": row["username"], "gender": row["gender"]}
+    return {"token": token, "username": row["username"], "gender": row["gender"], "email": row["email"]}
 
 
 @app.get("/auth/me")
 def me(user_name: str = Depends(current_username)):
     conn = get_db()
-    row = conn.execute("SELECT username, gender FROM users WHERE username = ?", (user_name,)).fetchone()
+    row = conn.execute("SELECT username, gender, email FROM users WHERE username = ?", (user_name,)).fetchone()
     conn.close()
-    return {"username": user_name, "gender": row["gender"] if row else ""}
+    return {"username": user_name, "gender": row["gender"] if row else "", "email": row["email"] if row else ""}
 
 
 @app.post("/auth/logout")
