@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -306,12 +307,19 @@ def apply_card_extras(conn):
             (age, " ".join(str(ex.get("role") or "").split())[:60],
              " ".join(str(ex.get("tagline") or "").split())[:160], clean_tags(ex.get("tags")), row["id"]),
         )
-        path = _find_image(ex.get("image"))
-        if path:
-            with open(path, "rb") as f:
-                data = f.read()
-            if sniff_image(data) and len(data) <= 5_000_000:
-                save_image(conn, row["id"], data)
+        data = None
+        if ex.get("image_b64"):          # photo stored as text inside card_extras.py (works as a Render Secret File)
+            try:
+                data = base64.b64decode("".join(str(ex["image_b64"]).split()))
+            except Exception:
+                data = None
+        else:
+            path = _find_image(ex.get("image"))   # or a normal file in character_images/
+            if path:
+                with open(path, "rb") as f:
+                    data = f.read()
+        if data and sniff_image(data) and len(data) <= 5_000_000:
+            save_image(conn, row["id"], data)
 
 
 def init_db():
