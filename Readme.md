@@ -172,3 +172,27 @@ Open http://localhost:8501, create an account and start chatting. Without `API_U
 | `API_URL` | Backend address used by the front end | hosted demo URL |
 
 The SQLite database (`app.db`) and the ChromaDB folder (`chroma_data/`) are created automatically on first run. The first chat may be slow while ChromaDB downloads its embedding model.
+
+## API
+
+Interactive docs are available at `http://localhost:8000/docs` (Swagger UI). Every route except signup, login and the health check needs the header `Authorization: Bearer <token>`.
+
+| Method | Route | What it does |
+|---|---|---|
+| GET | `/` | Health check |
+| POST | `/auth/signup` | Create an account (email, username, password, gender) and return a session token |
+| POST | `/auth/login` | Log in with email and password, return a session token |
+| GET | `/auth/me` | Current user |
+| POST | `/auth/logout` | End the current session |
+| GET | `/characters` | Built-in characters plus the user's own |
+| POST | `/characters` | Create a character (safety checks, optional auto-fill) |
+| GET | `/characters/{id}` | Full card of a built-in or own character |
+| PATCH | `/characters/{id}` | Edit an own character |
+| DELETE | `/characters/{id}` | Delete an own character and its chats |
+| GET / PUT / DELETE | `/characters/{id}/image` | Read, upload (PNG, JPEG or WebP, up to 2 MB) or remove a photo |
+| POST | `/chats` | Start a chat with a character |
+| GET | `/chats` | The user's chats, newest first |
+| GET | `/chats/{id}/messages` | Messages of a chat |
+| POST | `/chats/{id}/messages` | Send a message; the reply streams back as server-sent events |
+| POST | `/chats/{id}/regenerate` | Regenerate the last reply (streamed) |
+| DELETE | `/chats/{id}` | Delete a chat and its memories |
