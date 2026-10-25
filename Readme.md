@@ -13,3 +13,71 @@ Chat with AI characters that remember you. Users sign up, pick or create a chara
 | Create | My Characters |
 |---|---|
 | ![Create](docs/create.png) | ![My Characters](docs/characters.png) |
+
+## Features
+
+**Chat**
+- Real-time streaming replies, with a one-click **Regenerate** for the last reply
+- Multiple chats per user, with a chat list and per-chat delete
+- **Long-term memory:** every exchange is embedded in ChromaDB. Once a chat grows past the recent-history window, relevant older exchanges are recalled by semantic search and added to the prompt, so a character can remember something said many messages earlier
+- Recent-history window (configurable) plus a distance threshold, so only relevant memories reach the prompt
+
+**Characters**
+- Built-in characters, plus user-created characters that can be edited, deleted and given a photo
+- **Auto-fill:** give a name and short description, and the LLM generates personality, scenario, example dialogue and first message, without overwriting anything the user wrote
+- Automatic character-gender detection, with a pronoun-consistency check that retries if the output uses the wrong pronouns
+- Character cards with age, role, tagline, tags and photo
+
+**Prompt pipeline**
+- Structured system prompt with rules for formatting, pacing, continuity and reply length
+- Gender-aware placeholders so one character card works for any user
+- Replies are trimmed to the last complete sentence if the token limit cuts them off
+- If the model call fails, the user's message is rolled back, so retrying never creates a duplicate
+
+**Safety**
+- Adults-only: age validation plus pattern checks for under-18 details in any field
+- Real-person block: a name list plus an LLM check, so characters can't impersonate public figures
+
+**Accounts and security**
+- Sign up with email, username and password; one account per email; log in with email and password
+- Passwords hashed with PBKDF2-SHA256 (240,000 rounds, per-user salt)
+- Session tokens stored only as SHA-256 hashes, expiring after 14 days
+- Lockout after 5 failed logins, and a per-IP signup rate limit
+- Ownership checks on every chat, so users can't open each other's chats
+
+**LLM layer**
+- Works with any OpenAI-compatible API (Groq, OpenRouter) or local Ollama, chosen by environment variables
+- Automatic fallback to a second model on rate limits, outages or empty replies
+
+**UI**
+- Custom-styled Streamlit front end: card grid, chat list, loading states and page transitions
+- Parallel API calls and a short cache, to keep screens fast on a free-tier server
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[User's browser] --> S[Streamlit front end<br/>app.py]
+    S -- "REST + streaming (SSE)<br/>Bearer token" --> A[FastAPI backend<br/>main.py]
+    A --> DB[(SQLite<br/>users, sessions, characters,<br/>chats, messages, images)]
+    A --> V[(ChromaDB<br/>long-term chat memory)]
+    A --> L[LLM provider<br/>Groq / OpenAI-compatible<br/>or local Ollama]
+    L -. "fallback model on error" .-> L
+```
+
+### What happens when you send a message
+
+1. The browser sends the message to Streamlit, which calls `POST /chats/{id}/messages` on the backend with the user's session token.
+2. The backend checks the token against the `sessions` table (stored as a SHA-256 hash) and checks that the chat belongs to that user. The user's message is saved to SQLite before the model is called.
+3. It loads the last N messages from SQLite and asks ChromaDB for the most relevant older exchanges from the same chat.
+4. It builds the prompt: the character card, user-gender wording, the writing rules, the recalled memories, the recent history and a short reminder attached to the last user message.
+5. The prompt goes to the LLM. If the main model fails, the fallback model is tried.
+6. The reply streams back to Streamlit token by token. It is then saved to SQLite and embedded into ChromaDB for later recall.
+
+### Where data lives
+
+| Store | What it holds |
+|---|---|
+| SQLite (`app.db`) | Accounts, sessions, characters, chats, messages, character photos |
+| ChromaDB (`chroma_data/`) | Embeddings of past exchanges for long-term memory, filtered per chat |
+| Environment variables | LLM endpoint, API key, model names |
