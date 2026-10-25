@@ -173,6 +173,20 @@ Open http://localhost:8501, create an account and start chatting. Without `API_U
 
 The SQLite database (`app.db`) and the ChromaDB folder (`chroma_data/`) are created automatically on first run. The first chat may be slow while ChromaDB downloads its embedding model.
 
+## Character cards and private content
+
+The public repo ships with one neutral demo character, **Nora Vale** (`characters_demo.py`), and a toned-down set of romance rules. This is what you get when you clone and run it.
+
+My own character cards, which include mature romance themes, are kept out of the repo:
+
+- `characters_private.py` holds those cards and their prompt rules. It is git-ignored.
+- `card_extras.py` and `character_images/` hold card details and photos. They are also git-ignored.
+- At startup `main.py` tries to load `characters_private.py` (locally, or from `/etc/secrets` as a Secret File on Render). If it isn't there, the app falls back to `characters_demo.py`.
+
+All characters, built-in or user-created, must be adults (18+), and the public rules keep romance tasteful and non-explicit.
+
+To add your own built-in characters, create a `characters_private.py` with the same structure as `characters_demo.py`: a list called `BUILTIN_CHARACTERS`, plus `ROMANCE_RULES` and `EXTRA_USER_WORDS`.
+
 ## API
 
 Interactive docs are available at `http://localhost:8000/docs` (Swagger UI). Every route except signup, login and the health check needs the header `Authorization: Bearer <token>`.
@@ -196,3 +210,19 @@ Interactive docs are available at `http://localhost:8000/docs` (Swagger UI). Eve
 | POST | `/chats/{id}/messages` | Send a message; the reply streams back as server-sent events |
 | POST | `/chats/{id}/regenerate` | Regenerate the last reply (streamed) |
 | DELETE | `/chats/{id}` | Delete a chat and its memories |
+
+## Deployment
+
+The backend is deployed as a **Render web service** from this repo.
+
+| Setting | Value |
+|---|---|
+| Build command | `pip install -r requirements.txt` |
+| Start command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Environment variables | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_FALLBACK_MODEL`, `CONTEXT_MESSAGES` |
+| Secret Files (optional) | `characters_private.py`, plus any character photos, mounted under `/etc/secrets` |
+
+Notes:
+- The app looks for `characters_private.py` and character photos in `/etc/secrets`, so private cards never need to be committed.
+- On Render's free plan the service sleeps when idle, so the first request after a pause can take a while. The Streamlit front end pings the backend at startup to wake it.
+- The free plan has no persistent disk, so `app.db` and `chroma_data/` reset when the service restarts. That is fine for a demo. For real use, move to a persistent disk or a hosted database.
