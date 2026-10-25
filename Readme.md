@@ -6,10 +6,10 @@ Chat with AI characters that remember you. Users sign up, pick or create a chara
 
 ## Demo
 
-[![Watch the demo](docs/demo-thumb.png)](https://youtu.be/YOUR_VIDEO_ID)
+| Discover | Chat |
+|---|---|
+| ![Discover](docs/discover.png) | ![Chat](docs/chat.png) |
 
-*60-second walkthrough: signup, chatting with a character, memory recall, and creating a new character.*
-
-| Discover | Chat | Create |
-|---|---|---|
-| ![Discover](docs/discover.png) | ![Chat](docs/chat.png) | ![Create](docs/create.png) |
+| Create | My Characters |
+|---|---|
+| ![Create](docs/create.png) | ![My Characters](docs/characters.png) |
