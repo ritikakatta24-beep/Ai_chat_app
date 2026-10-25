@@ -1,7 +1,10 @@
 import json
 import logging
 import os
+import hashlib
+import hmac
 import re
+import secrets
 import sqlite3
 import sys
 import time
@@ -10,7 +13,7 @@ from typing import Optional
 
 import chromadb
 import ollama
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -82,6 +85,12 @@ except ImportError:
     from characters_demo import BUILTIN_CHARACTERS
     ROMANCE_RULES = PUBLIC_ROMANCE_RULES
     EXTRA_USER_WORDS = {}
+# optional: card details (age, role, tagline, tags, photo) for built-in characters, keyed by name
+try:
+    from card_extras import CARD_EXTRAS
+except ImportError:
+    CARD_EXTRAS = {}
+IMAGE_DIRS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "character_images"), "/etc/secrets"]
 
 
 # ---------------- Prompt ----------------
@@ -230,6 +239,81 @@ def get_db():
     return conn
 
 
+# ---------------- Character card details & photos ----------------
+IMAGE_MAX_BYTES = 2_000_000
+
+
+def sniff_image(data):
+    """Return the mime type if the bytes really are a PNG, JPEG or WebP, else None."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def save_image(conn, character_id, data):
+    conn.execute(
+        "INSERT OR REPLACE INTO character_images (character_id, mime, data, version) VALUES (?, ?, ?, ?)",
+        (character_id, sniff_image(data), data, hashlib.sha1(data).hexdigest()[:10]),
+    )
+
+
+def clean_tags(value):
+    """'ruthless, Possessive ,,cold' -> 'ruthless,Possessive,cold' (max 6 tags, 24 chars each)."""
+    parts = value if isinstance(value, (list, tuple)) else str(value or "").split(",")
+    out = []
+    for p in parts:
+        t = " ".join(str(p).split())[:24]
+        if t and t.lower() not in [x.lower() for x in out]:
+            out.append(t)
+    return ",".join(out[:6])
+
+
+def check_card_fields(age, role, tagline):
+    if age is not None and not (18 <= age <= 120):
+        raise HTTPException(400, {"code": "minor", "message": "Characters must be adults: age has to be 18 or older."})
+    if len(role) > 60:
+        raise HTTPException(400, {"code": "too_long", "message": "Role is too long (60 characters max)."})
+    if len(tagline) > 160:
+        raise HTTPException(400, {"code": "too_long", "message": "Tagline is too long (160 characters max)."})
+
+
+def _find_image(name):
+    if not name:
+        return None
+    for d in IMAGE_DIRS:
+        p = os.path.join(d, os.path.basename(name))
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def apply_card_extras(conn):
+    extras = {k: dict(v) for k, v in CARD_EXTRAS.items()}
+    for c in BUILTIN_CHARACTERS:  # a card may also carry the keys itself
+        extras.setdefault(c["name"], {}).update({k: c[k] for k in ("age", "role", "tagline", "tags", "image") if k in c})
+    for name, ex in extras.items():
+        row = conn.execute("SELECT id FROM characters WHERE is_builtin = 1 AND name = ?", (name,)).fetchone()
+        if not row:
+            continue
+        age = ex.get("age")
+        age = age if isinstance(age, int) and 18 <= age <= 120 else None
+        conn.execute(
+            "UPDATE characters SET age = ?, role = ?, tagline = ?, tags = ? WHERE id = ?",
+            (age, " ".join(str(ex.get("role") or "").split())[:60],
+             " ".join(str(ex.get("tagline") or "").split())[:160], clean_tags(ex.get("tags")), row["id"]),
+        )
+        path = _find_image(ex.get("image"))
+        if path:
+            with open(path, "rb") as f:
+                data = f.read()
+            if sniff_image(data) and len(data) <= 5_000_000:
+                save_image(conn, row["id"], data)
+
+
 def init_db():
     conn = get_db()
     conn.executescript("""
@@ -254,6 +338,25 @@ def init_db():
         chat_id INTEGER NOT NULL,
         role TEXT NOT NULL,
         content TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        pw_salt BLOB NOT NULL,
+        pw_hash BLOB NOT NULL,
+        gender TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS character_images (
+        character_id INTEGER PRIMARY KEY,
+        mime TEXT NOT NULL,
+        data BLOB NOT NULL,
+        version TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        expires_at REAL NOT NULL
     );
     """)
     # built-in characters: insert if missing, UPDATE if present
@@ -280,6 +383,12 @@ def init_db():
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(chats)").fetchall()]
     if "user_gender" not in cols:
         conn.execute("ALTER TABLE chats ADD COLUMN user_gender TEXT NOT NULL DEFAULT ''")
+    char_cols = [r["name"] for r in conn.execute("PRAGMA table_info(characters)").fetchall()]
+    for col, ddl in (("age", "INTEGER"), ("role", "TEXT NOT NULL DEFAULT ''"),
+                     ("tagline", "TEXT NOT NULL DEFAULT ''"), ("tags", "TEXT NOT NULL DEFAULT ''")):
+        if col not in char_cols:
+            conn.execute(f"ALTER TABLE characters ADD COLUMN {col} {ddl}")
+    apply_card_extras(conn)
     conn.commit()
     conn.close()
 
@@ -625,6 +734,161 @@ def validate_character(name, description, first_message="", personality="", scen
     return (True, "", "")
 
 
+# ---------------- Accounts & login ----------------
+SESSION_DAYS = 14
+PBKDF2_ROUNDS = 240_000
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{1,29}$")   # 2-30 chars
+MAX_FAILS, LOCK_SECONDS = 5, 300          # 5 wrong passwords -> locked for 5 minutes
+MAX_SIGNUPS_PER_HOUR = 10                 # per IP
+_fails = {}      # "user:alice" / "ip:1.2.3.4" -> failure timestamps (in memory, resets on restart)
+_signups = {}    # ip -> signup timestamps
+
+
+def _hash_pw(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
+
+
+def _token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _client_ip(request):
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() or (request.client.host if request.client else "unknown"))
+
+
+def _recent(store, key, window):
+    now = time.time()
+    lst = [t for t in store.get(key, []) if now - t < window]
+    store[key] = lst
+    return lst
+
+
+def _issue_session(conn, username):
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    conn.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    conn.execute(
+        "INSERT INTO sessions (token_hash, username, expires_at) VALUES (?, ?, ?)",
+        (_token_hash(token), username, now + SESSION_DAYS * 86400),
+    )
+    conn.commit()
+    return token
+
+
+def _bearer(authorization):
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def current_username(authorization: str = Header(default="")) -> str:
+    """Who is calling? Taken from the login token, never from anything the client claims."""
+    token = _bearer(authorization)
+    if not token:
+        raise HTTPException(401, "Please log in.")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT username, expires_at FROM sessions WHERE token_hash = ?", (_token_hash(token),)
+    ).fetchone()
+    if row and row["expires_at"] < time.time():
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),))
+        conn.commit()
+        row = None
+    conn.close()
+    if not row:
+        raise HTTPException(401, "Your session has expired. Please log in again.")
+    return row["username"]
+
+
+class SignupBody(BaseModel):
+    username: str
+    password: str
+    gender: str = ""     # "female" / "male" / "nonbinary" / "" (not given)
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/signup")
+def signup(body: SignupBody, request: Request):
+    username = body.username.strip()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(400, "Username must be 2-30 characters: letters, numbers, spaces, dot, dash or underscore.")
+    if not (8 <= len(body.password) <= 128):
+        raise HTTPException(400, "Password must be 8 to 128 characters.")
+    ip = _client_ip(request)
+    if len(_recent(_signups, ip, 3600)) >= MAX_SIGNUPS_PER_HOUR:
+        raise HTTPException(429, "Too many accounts created from this network. Please try again later.")
+    gender = normalize_gender(body.gender)
+    salt = secrets.token_bytes(16)
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, pw_salt, pw_hash, gender, created_at) VALUES (?, ?, ?, ?, ?)",
+            (username, salt, _hash_pw(body.password, salt), gender, time.time()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(409, "That username is already taken.")
+    _signups.setdefault(ip, []).append(time.time())
+    token = _issue_session(conn, username)
+    conn.close()
+    return {"token": token, "username": username, "gender": gender}
+
+
+@app.post("/auth/login")
+def login(body: LoginBody, request: Request):
+    username = body.username.strip()
+    keys = [f"user:{username.lower()}", f"ip:{_client_ip(request)}"]
+    if any(len(_recent(_fails, k, LOCK_SECONDS)) >= MAX_FAILS for k in keys):
+        raise HTTPException(429, "Too many failed attempts. Please wait a few minutes and try again.")
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    # hash even when the user does not exist, so timing does not reveal which usernames are real
+    candidate = _hash_pw(body.password[:128], row["pw_salt"] if row else b"0" * 16)
+    if not row or not hmac.compare_digest(candidate, row["pw_hash"]):
+        conn.close()
+        for k in keys:
+            _fails.setdefault(k, []).append(time.time())
+        raise HTTPException(401, "Incorrect username or password.")
+    _fails.pop(keys[0], None)
+    token = _issue_session(conn, row["username"])
+    conn.close()
+    return {"token": token, "username": row["username"], "gender": row["gender"]}
+
+
+@app.get("/auth/me")
+def me(user_name: str = Depends(current_username)):
+    conn = get_db()
+    row = conn.execute("SELECT username, gender FROM users WHERE username = ?", (user_name,)).fetchone()
+    conn.close()
+    return {"username": user_name, "gender": row["gender"] if row else ""}
+
+
+@app.post("/auth/logout")
+def logout(authorization: str = Header(default=""), user_name: str = Depends(current_username)):
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE token_hash = ?", (_token_hash(_bearer(authorization)),))
+    conn.commit()
+    conn.close()
+    return {"logged_out": True}
+
+
+# ---------------- Ownership check ----------------
+def require_chat_owner(conn, chat_id, user_name):
+    """Return the chat row only if it belongs to user_name.
+    Both "missing" and "not yours" give the same 404, so chat ids cannot be probed."""
+    chat = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    if not chat or not user_name or chat["user_name"] != user_name:
+        conn.close()
+        raise HTTPException(404, "Chat not found")
+    return chat
+
+
 # ---------------- Request shapes ----------------
 class NewCharacter(BaseModel):
     name: str                      # required
@@ -633,9 +897,12 @@ class NewCharacter(BaseModel):
     scenario: str = ""             # optional
     personality: str = ""          # optional
     example_dialogue: str = ""     # optional (advanced)
-    created_by: str                # currently the user's name; becomes a user id once login exists
     gender: str = ""               # optional: "male" / "female" / "nonbinary". Auto-detected from the description if empty
     enhance: bool = True           # auto-fill empty fields (False = save exactly as given)
+    age: Optional[int] = None      # optional, shown on the card; must be 18 or older
+    role: str = ""                 # optional, e.g. "Psychology Professor"
+    tagline: str = ""              # optional, a line the character would say
+    tags: str = ""                 # optional, comma separated, up to 6 (e.g. "Ruthless, Possessive")
 
 
 class EditCharacter(BaseModel):
@@ -646,11 +913,13 @@ class EditCharacter(BaseModel):
     scenario: Optional[str] = None
     personality: Optional[str] = None
     example_dialogue: Optional[str] = None
+    age: Optional[int] = None      # 0 removes the age
+    role: Optional[str] = None
+    tagline: Optional[str] = None
+    tags: Optional[str] = None
 
 
 class StartChat(BaseModel):
-    user_name: str
-    user_gender: str = ""        # "female" / "male" / "nonbinary" / "" (not given)
     character_id: int
 
 
@@ -665,19 +934,26 @@ def home():
 
 
 @app.get("/characters")
-def list_characters(user_name: str = ""):
+def list_characters(user_name: str = Depends(current_username)):
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name, description, is_builtin FROM characters "
-        "WHERE is_builtin = 1 OR created_by = ?",
+        "SELECT c.id, c.name, c.description, c.is_builtin, c.age, c.role, c.tagline, c.tags, "
+        "i.version AS image_v FROM characters c "
+        "LEFT JOIN character_images i ON i.character_id = c.id "
+        "WHERE c.is_builtin = 1 OR c.created_by = ?",
         (user_name,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["tags"] = [t for t in (d["tags"] or "").split(",") if t]
+        out.append(d)
+    return out
 
 
 @app.post("/characters")
-def create_character(c: NewCharacter):
+def create_character(c: NewCharacter, user_name: str = Depends(current_username)):
     first_message = c.first_message.strip()
     personality, scenario, example = c.personality.strip(), c.scenario.strip(), c.example_dialogue.strip()
     ok, code, message = validate_character(
@@ -685,6 +961,12 @@ def create_character(c: NewCharacter):
     )
     if not ok:
         raise HTTPException(400, {"code": code, "message": message})
+    role, tagline, tags = " ".join(c.role.split()), " ".join(c.tagline.split()), clean_tags(c.tags)
+    check_card_fields(c.age, role, tagline)
+    if looks_like_minor(" ".join([role, tagline, tags])):
+        raise HTTPException(400, {"code": "minor", "message":
+                                  "Characters in romantic roleplay must be adults (18+). Please remove any age "
+                                  "under 18 or school-age details."})
     # gender: use the one the user gave, otherwise auto-detect from the description
     gender = normalize_gender(c.gender)
     gender_guessed = False
@@ -702,10 +984,10 @@ def create_character(c: NewCharacter):
     conn = get_db()
     cur = conn.execute(
         "INSERT INTO characters (name, description, personality, scenario, "
-        "example_dialogue, first_message, is_builtin, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+        "example_dialogue, first_message, is_builtin, created_by, age, role, tagline, tags) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
         (c.name, c.description, personality, scenario,
-         example, first_message, c.created_by),
+         example, first_message, user_name, c.age, role, tagline, tags),
     )
     conn.commit()
     new_id = cur.lastrowid
@@ -724,7 +1006,7 @@ def create_character(c: NewCharacter):
 
 
 @app.get("/characters/{character_id}")
-def get_character(character_id: int, user_name: str = ""):
+def get_character(character_id: int, user_name: str = Depends(current_username)):
     """Full card (for the edit screen / backups). Only own characters or built-ins are returned."""
     conn = get_db()
     row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
@@ -737,16 +1019,10 @@ def get_character(character_id: int, user_name: str = ""):
 
 
 @app.delete("/chats/{chat_id}")
-def delete_chat(chat_id: int, user_name: str):
+def delete_chat(chat_id: int, user_name: str = Depends(current_username)):
     """Delete a single chat (and its memories). Characters are untouched."""
     conn = get_db()
-    chat = conn.execute("SELECT id, user_name FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    if not chat:
-        conn.close()
-        raise HTTPException(404, "Chat not found")
-    if chat["user_name"] != user_name:
-        conn.close()
-        raise HTTPException(403, "You can only delete your own chats")
+    require_chat_owner(conn, chat_id, user_name)   # 404 for both "missing" and "not yours"
     conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
     conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
     conn.commit()
@@ -759,7 +1035,7 @@ def delete_chat(chat_id: int, user_name: str):
 
 
 @app.patch("/characters/{character_id}")
-def edit_character(character_id: int, body: EditCharacter, user_name: str):
+def edit_character(character_id: int, body: EditCharacter, user_name: str = Depends(current_username)):
     """Edit the fields of a character you created. Built-in characters cannot be edited here (they are changed in code)."""
     conn = get_db()
     row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
@@ -773,14 +1049,26 @@ def edit_character(character_id: int, body: EditCharacter, user_name: str):
         conn.close()
         raise HTTPException(403, "You can only edit characters you created")
 
-    fields = ["name", "description", "first_message", "scenario", "personality", "example_dialogue"]
-    merged = {f: row[f] for f in fields}
+    fields = ["name", "description", "first_message", "scenario", "personality", "example_dialogue",
+              "role", "tagline", "tags"]
+    merged = {f: (row[f] or "") for f in fields}
     changed = []
     for f in fields:
         v = getattr(body, f)
         if v is not None and v.strip() != (row[f] or ""):
             merged[f] = v.strip()
             changed.append(f)
+    merged["role"] = " ".join(merged["role"].split())
+    merged["tagline"] = " ".join(merged["tagline"].split())
+    merged["tags"] = clean_tags(merged["tags"])
+    new_age = row["age"]
+    if body.age is not None:
+        new_age = None if body.age == 0 else body.age
+    try:
+        check_card_fields(new_age, merged["role"], merged["tagline"])
+    except HTTPException:
+        conn.close()
+        raise
     if not merged["name"] or not merged["description"] or not merged["first_message"]:
         conn.close()
         raise HTTPException(400, {"code": "empty_field",
@@ -796,20 +1084,21 @@ def edit_character(character_id: int, body: EditCharacter, user_name: str):
         raise HTTPException(400, {"code": "real_person", "message":
                                   "This looks like a real, famous person. Please use an original character "
                                   "with an invented name."})
-    if changed:
+    if changed or new_age != row["age"]:
         conn.execute(
             "UPDATE characters SET name = ?, description = ?, first_message = ?, scenario = ?, "
-            "personality = ?, example_dialogue = ? WHERE id = ?",
+            "personality = ?, example_dialogue = ?, role = ?, tagline = ?, tags = ?, age = ? WHERE id = ?",
             (merged["name"], merged["description"], merged["first_message"], merged["scenario"],
-             merged["personality"], merged["example_dialogue"], character_id),
+             merged["personality"], merged["example_dialogue"], merged["role"], merged["tagline"],
+             merged["tags"], new_age, character_id),
         )
         conn.commit()
     conn.close()
-    return {"id": character_id, "changed": changed, **merged}
+    return {"id": character_id, "changed": changed, **merged, "age": new_age}
 
 
 @app.delete("/characters/{character_id}")
-def delete_character(character_id: int, user_name: str):
+def delete_character(character_id: int, user_name: str = Depends(current_username)):
     # only a character you created can be deleted; never built-in ones
     conn = get_db()
     char = conn.execute(
@@ -834,6 +1123,7 @@ def delete_character(character_id: int, user_name: str):
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (cid,))
     conn.execute("DELETE FROM chats WHERE character_id = ?", (character_id,))
     conn.execute("DELETE FROM characters WHERE id = ?", (character_id,))
+    conn.execute("DELETE FROM character_images WHERE character_id = ?", (character_id,))
     conn.commit()
     conn.close()
 
@@ -846,8 +1136,66 @@ def delete_character(character_id: int, user_name: str):
     return {"deleted": character_id, "chats_removed": len(chat_ids)}
 
 
+# ---------------- Character photos ----------------
+def _own_character_row(conn, character_id, user_name):
+    row = conn.execute("SELECT id, is_builtin, created_by FROM characters WHERE id = ?", (character_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(404, "Character not found")
+    if row["is_builtin"] or row["created_by"] != user_name:
+        conn.close()
+        raise HTTPException(403, "You can only change the photo of characters you created")
+    return row
+
+
+@app.get("/characters/{character_id}/image")
+def get_character_image(character_id: int, user_name: str = Depends(current_username)):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT c.is_builtin, c.created_by, i.mime, i.data FROM characters c "
+        "JOIN character_images i ON i.character_id = c.id WHERE c.id = ?", (character_id,)
+    ).fetchone()
+    conn.close()
+    if not row or (not row["is_builtin"] and row["created_by"] != user_name):
+        raise HTTPException(404, "No photo")
+    return Response(content=bytes(row["data"]), media_type=row["mime"],
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.put("/characters/{character_id}/image")
+async def set_character_image(character_id: int, request: Request, user_name: str = Depends(current_username)):
+    """Upload a photo: send the raw image bytes as the request body (PNG, JPEG or WebP, up to 2 MB)."""
+    try:
+        if int(request.headers.get("content-length") or 0) > IMAGE_MAX_BYTES:
+            raise HTTPException(413, "Photo is too large (2 MB max).")
+    except ValueError:
+        pass
+    data = await request.body()
+    if len(data) > IMAGE_MAX_BYTES:
+        raise HTTPException(413, "Photo is too large (2 MB max).")
+    if not sniff_image(data):
+        raise HTTPException(400, "Please upload a PNG, JPEG or WebP image.")
+    conn = get_db()
+    _own_character_row(conn, character_id, user_name)
+    save_image(conn, character_id, data)
+    conn.commit()
+    version = conn.execute("SELECT version FROM character_images WHERE character_id = ?", (character_id,)).fetchone()["version"]
+    conn.close()
+    return {"image_v": version}
+
+
+@app.delete("/characters/{character_id}/image")
+def delete_character_image(character_id: int, user_name: str = Depends(current_username)):
+    conn = get_db()
+    _own_character_row(conn, character_id, user_name)
+    conn.execute("DELETE FROM character_images WHERE character_id = ?", (character_id,))
+    conn.commit()
+    conn.close()
+    return {"removed": True}
+
+
 @app.post("/chats")
-def start_chat(body: StartChat):
+def start_chat(body: StartChat, user_name: str = Depends(current_username)):
     conn = get_db()
     char = conn.execute(
         "SELECT * FROM characters WHERE id = ?", (body.character_id,)
@@ -856,10 +1204,12 @@ def start_chat(body: StartChat):
         conn.close()
         raise HTTPException(404, "Character not found")
 
-    first = fill(char["first_message"], body.user_name, char["name"], normalize_gender(body.user_gender))
+    urow = conn.execute("SELECT gender FROM users WHERE username = ?", (user_name,)).fetchone()
+    user_gender = normalize_gender(urow["gender"]) if urow else ""
+    first = fill(char["first_message"], user_name, char["name"], user_gender)
     cur = conn.execute(
         "INSERT INTO chats (user_name, character_id, user_gender) VALUES (?, ?, ?)",
-        (body.user_name, body.character_id, normalize_gender(body.user_gender)),
+        (user_name, body.character_id, user_gender),
     )
     chat_id = cur.lastrowid
     conn.execute(
@@ -872,7 +1222,7 @@ def start_chat(body: StartChat):
 
 
 @app.get("/chats")
-def list_chats(user_name: str, character_id: Optional[int] = None):
+def list_chats(character_id: Optional[int] = None, user_name: str = Depends(current_username)):
     """All of a user's chats (newest first). Pass character_id to get only that character's chats.
     'Latest chat with this character' = the first item when character_id is given."""
     conn = get_db()
@@ -902,8 +1252,9 @@ def list_chats(user_name: str, character_id: Optional[int] = None):
 
 
 @app.get("/chats/{chat_id}/messages")
-def get_messages(chat_id: int):
+def get_messages(chat_id: int, user_name: str = Depends(current_username)):
     conn = get_db()
+    require_chat_owner(conn, chat_id, user_name)
     rows = conn.execute(
         "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,)
     ).fetchall()
@@ -912,12 +1263,9 @@ def get_messages(chat_id: int):
 
 
 @app.post("/chats/{chat_id}/messages")
-def send_message(chat_id: int, body: SendMessage):
+def send_message(chat_id: int, body: SendMessage, user_name: str = Depends(current_username)):
     conn = get_db()
-    chat = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    if not chat:
-        conn.close()
-        raise HTTPException(404, "Chat not found")
+    chat = require_chat_owner(conn, chat_id, user_name)
 
     char = conn.execute(
         "SELECT * FROM characters WHERE id = ?", (chat["character_id"],)
@@ -996,14 +1344,11 @@ def send_message(chat_id: int, body: SendMessage):
 
 
 @app.post("/chats/{chat_id}/regenerate")
-def regenerate(chat_id: int):
+def regenerate(chat_id: int, user_name: str = Depends(current_username)):
     """Regenerates the last assistant reply (when the user did not like it).
     The old reply is replaced only once the new one is complete; otherwise the old one is kept."""
     conn = get_db()
-    chat = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
-    if not chat:
-        conn.close()
-        raise HTTPException(404, "Chat not found")
+    chat = require_chat_owner(conn, chat_id, user_name)
     char = conn.execute(
         "SELECT * FROM characters WHERE id = ?", (chat["character_id"],)
     ).fetchone()

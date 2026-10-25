@@ -1,10 +1,9 @@
-# private content and local data
 characters_private.py
 app.db
 chroma_data/
 .env
- 
-# python
+card_extras.py
+character_images/
 __pycache__/
 *.pyc
 venv/
