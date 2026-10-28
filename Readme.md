@@ -130,7 +130,7 @@ cd Ai_chat_app
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-pip install -r requirements-frontend.txt
+pip install -r frontend/requirements.txt
 ```
 
 ### 1. Start the backend
@@ -156,7 +156,7 @@ Ollama is used automatically when `LLM_BASE_URL` is not set. Use `CHAT_MODEL` to
 In a second terminal:
 ```bash
 source venv/bin/activate
-API_URL=http://localhost:8000 streamlit run app.py
+API_URL=http://localhost:8000 streamlit run frontend/app.py
 ```
 Open http://localhost:8501, create an account and start chatting. Without `API_URL`, the front end connects to a backend on `http://localhost:8000`. To use a hosted backend, set `API_URL` to its address.
 
