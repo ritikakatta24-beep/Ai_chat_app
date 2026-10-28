@@ -6,6 +6,7 @@ import json
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from functools import lru_cache
 
@@ -13,7 +14,7 @@ import requests
 import streamlit as st
 from PIL import Image, ImageOps
 
-API = os.environ.get("API_URL", "https://ai-chat-app-q14c.onrender.com")
+API = os.environ.get("API_URL", "http://localhost:8000")
 APP_NAME = "VelvetTalk"  # change this to your own app name
 
 st.set_page_config(page_title=APP_NAME, page_icon="🌹", layout="wide",
@@ -51,27 +52,30 @@ span[data-testid="stIconMaterial"], [data-testid="stIconMaterial"] {
     background: #6f2531; border-color: #8a2c3c; color: #f6e9e6; }
 .stButton > button[kind="primary"]:hover { background: #8a2c3c; }
 
-/* character cards: photo fills the card, text and button sit on top (photo is set per card).
-   Every block has a fixed height, anchored to the bottom, so all cards line up exactly the same
-   no matter how many lines the quote or the tags take. */
-[class*="st-key-card_"] { border: 1px solid #2c1c20; border-radius: 22px; padding: 1.3rem 1.2rem 1.3rem;
-    min-height: 540px; justify-content: flex-end; gap: 0; background-color: #0e0a0b;
-    background-size: cover; background-position: center 12%; background-repeat: no-repeat; overflow: hidden; }
-[class*="st-key-card_"] > div { flex: 0 0 auto !important; }   /* nothing may shrink onto the button */
-.c-name { font-family: 'Cormorant Garamond', serif; font-size: 2.2rem; font-weight: 600; line-height: 1.15;
-          height: 2.53rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+/* character cards: the photo sits in the top part of the card and fades into the dark; all the text
+   starts BELOW the photo (the photo is set per card on ::before). Every text block has a fixed height,
+   so all cards line up exactly the same no matter how many lines the quote or the tags take. */
+[class*="st-key-card_"] { position: relative; border: 1px solid #2c1c20; border-radius: 22px;
+    padding: 190px 1rem 1rem; gap: 0; background-color: #0b0809; overflow: hidden; }
+[class*="st-key-card_"]::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 250px;
+    background-size: cover; background-position: center 18%; background-repeat: no-repeat;
+    -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 62%, transparent 100%);
+    mask-image: linear-gradient(180deg, #000 0%, #000 62%, transparent 100%); }
+[class*="st-key-card_"] > div { position: relative; z-index: 1; flex: 0 0 auto !important; }   /* above the photo; nothing shrinks onto the button */
+.c-name { font-family: 'Cormorant Garamond', serif; font-size: 1.9rem; font-weight: 600; line-height: 1.15;
+          height: 2.19rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
           color: #f6efec; text-shadow: 0 2px 12px rgba(0,0,0,.7); }
-.c-sub { font-family: 'Cormorant Garamond', serif; font-size: 1.1rem; line-height: 1.3; height: 1.43rem;
+.c-sub { font-family: 'Cormorant Garamond', serif; font-size: 1rem; line-height: 1.3; height: 1.3rem;
          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b9acaa; }
-.c-quote { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 1.22rem; line-height: 1.3;
-           color: #ddd2cf; margin: .4rem 0 .7rem; height: 4.76rem;
-           display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-/* tags: room for 4 rows, packed against the bottom so they always sit the same distance above the
-   button, with clear gaps between the pills (fewer rows just leaves empty space above them) */
-.c-tags { display: flex; flex-wrap: wrap; gap: .6rem .5rem; margin: 0 0 1.1rem; min-height: 8.8rem;
+.c-quote { font-family: 'Cormorant Garamond', serif; font-style: italic; font-size: 1.08rem; line-height: 1.3;
+           color: #ddd2cf; margin: .3rem 0 .5rem; height: 2.81rem;
+           display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* tags: smaller pills, room for 2 rows, packed against the bottom so they always sit the same distance
+   above the button, with clear gaps between the pills (fewer rows just leaves empty space above them) */
+.c-tags { display: flex; flex-wrap: wrap; gap: .45rem .4rem; margin: 0 0 .9rem; min-height: 3.7rem;
           align-content: flex-end; }
 .c-tags span { border: 1px solid #7a2a35; background: rgba(8,5,6,.7); color: #efe5e2; border-radius: 999px;
-               padding: .16rem .8rem; font-family: 'Cormorant Garamond', serif; font-size: 1.02rem;
+               padding: .1rem .65rem; font-family: 'Cormorant Garamond', serif; font-size: .92rem;
                line-height: 1.25; white-space: nowrap; }
 
 /* hide the "Press Enter to submit form" hint: it sat on top of the placeholder text */
@@ -84,6 +88,10 @@ span[data-testid="stIconMaterial"], [data-testid="stIconMaterial"] {
    while the next run loads (that grey flash is what looked abrupt) */
 @keyframes vtFade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 [class*="st-key-page_"] { animation: vtFade .4s ease both; }
+@keyframes vtPulse { 0%, 100% { opacity: .25; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.15); } }
+.vt-loading { display: flex; align-items: center; justify-content: center; gap: .8rem; padding: 4.5rem 0;
+              font-family: 'Cormorant Garamond', serif; font-size: 1.5rem; color: #a8999a; }
+.vt-loading i { width: 14px; height: 14px; border-radius: 50%; background: #8a2c3c; animation: vtPulse 1s ease-in-out infinite; }
 [data-stale="true"], .stApp [data-stale="true"] { opacity: 1 !important; transition: none !important; }
 .stButton > button, [data-testid="stFormSubmitButton"] > button {
     transition: background-color .2s ease, border-color .2s ease, transform .15s ease; }
@@ -174,6 +182,48 @@ def call(method, path, **kw):
     elif method != "GET":
         st.session_state.pop("_chars_cache", None)   # something changed: fetch fresh next time
     return data
+
+
+def _cached_chars():
+    hit = st.session_state.get("_chars_cache")
+    if hit and time.time() - hit[0] < CHARS_TTL and hit[2] == st.session_state.get("token"):
+        return hit[1]
+    return None
+
+
+def call_many(paths):
+    """Fetch several GET endpoints at the same time, so a screen waits for one round trip, not one per call.
+    Returns a list in the same order; an entry is an Exception if that one request failed."""
+    headers, token = auth_headers(), st.session_state.get("token")
+    out, todo = {}, []
+    for p in paths:
+        if p == "/characters" and _cached_chars() is not None:
+            out[p] = _cached_chars()
+        else:
+            todo.append(p)
+
+    def one(p):
+        try:
+            return requests.get(API + p, headers=headers, timeout=90)
+        except requests.RequestException:
+            return None
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=len(todo)) as ex:
+            results = list(ex.map(one, todo))
+        for p, r in zip(todo, results):
+            if r is None:
+                out[p] = RuntimeError("Could not reach the server. It may be waking up, please try again in a moment.")
+            elif r.status_code == 401 and token:
+                drop_session("Your session has expired. Please log in again.")
+                raise RuntimeError("Your session has expired. Please log in again.")
+            elif not r.ok:
+                out[p] = RuntimeError(_err_text(r))
+            else:
+                out[p] = r.json()
+                if p == "/characters":
+                    st.session_state._chars_cache = (time.time(), out[p], token)
+    return [out[p] for p in paths]
 
 
 def stream_reply(path, payload=None):
@@ -310,6 +360,10 @@ ss("stream_error", None)
 ss("flash", None)
 ss("regen", False)
 ss("nav", "Discover")
+LOADER = None   # set by the router: the small "Opening..." line that is removed once the data has arrived
+BODY = None     # set by the router: the block that holds the current screen
+LOADING_TEXT = {"Discover": "Loading characters…", "Chats": "Opening your chat…",
+                "My Characters": "Loading your characters…", "Create": "Just a moment…"}
 
 # wake the (free-tier) server in the background while the user is typing
 if "warmed" not in st.session_state:
@@ -498,8 +552,6 @@ def header():
 
 
 # ---------------------------------------------------------------- pages
-SHADE = ("linear-gradient(180deg, rgba(8,5,6,.05) 0%, rgba(8,5,6,.30) 30%, "
-         "rgba(8,5,6,.88) 66%, rgba(8,5,6,.97) 100%)")
 CHAT_ICON = {"icon": ":material/chat_bubble:"} if "icon" in inspect.signature(st.button).parameters else {}
 
 
@@ -521,11 +573,15 @@ def card_html(c):
 def page_discover():
     st.markdown('<div class="section-title">Discover characters</div>', unsafe_allow_html=True)
     try:
-        characters = call("GET", "/characters")
-        chats = call("GET", "/chats")
+        characters, chats = call_many(["/characters", "/chats"])
+        for r in (characters, chats):
+            if isinstance(r, Exception):
+                raise r
     except RuntimeError as e:
+        LOADER.empty()
         st.error(str(e))
         return
+    LOADER.empty()
 
     latest = {}
     for c in chats:  # newest first
@@ -544,7 +600,7 @@ def page_discover():
         uri = photo_uri(c)
         c1, c2 = palette(c["name"])
         bg = f'url("{uri}")' if uri else f"linear-gradient(160deg,{c1},{c2})"
-        rules.append(f".st-key-card_{c['id']} {{ background-image: {SHADE}, {bg}; }}")
+        rules.append(f".st-key-card_{c['id']}::before {{ background-image: {bg}; }}")
     st.markdown("<style>" + "\n".join(rules) + "</style>", unsafe_allow_html=True)
 
     for i in range(0, len(items), 3):
@@ -560,14 +616,23 @@ def page_discover():
 
 
 def page_chats():
+    guess = st.session_state.chat_id       # we usually already know which chat to open, so fetch its messages too
+    paths = ["/chats", "/characters"] + ([f"/chats/{guess}/messages"] if guess else [])
     try:
-        chats = call("GET", "/chats")
+        got = call_many(paths)
+        chats = got[0]
+        if isinstance(chats, Exception):
+            raise chats
     except RuntimeError as e:
-        st.error(str(e))
+        with BODY:
+            LOADER.empty()
+            st.error(str(e))
         return
     if not chats:
-        st.markdown('<div class="section-title">No chats yet</div>', unsafe_allow_html=True)
-        st.info("Open Discover and start a chat with any character.")
+        with BODY:
+            LOADER.empty()
+            st.markdown('<div class="section-title">No chats yet</div>', unsafe_allow_html=True)
+            st.info("Open Discover and start a chat with any character.")
         return
 
     ids = [c["chat_id"] for c in chats]
@@ -576,13 +641,20 @@ def page_chats():
     cid = st.session_state.chat_id
     cur = next(c for c in chats if c["chat_id"] == cid)
     cname = cur["character_name"]
-    try:
-        chars = {c["id"]: c for c in call("GET", "/characters")}
-    except RuntimeError:
-        chars = {}
+    chars = {c["id"]: c for c in got[1]} if isinstance(got[1], list) else {}
     av = char_avatar(chars.get(cur["character_id"]), cname)
+    messages = got[2] if (len(got) > 2 and guess == cid and not isinstance(got[2], Exception)) else None
+    if messages is None:
+        try:
+            messages = call("GET", f"/chats/{cid}/messages")
+        except RuntimeError as e:
+            with BODY:
+                LOADER.empty()
+                st.error(str(e))
+            return
 
-    with st.container(key="page_Chats"):
+    with BODY:
+        LOADER.empty()
         left, right = st.columns([1, 2.4], gap="large")
 
     with left:
@@ -604,12 +676,6 @@ def page_chats():
                       use_container_width=True)
             st.button("Delete this chat", on_click=delete_chat, args=(cid,), use_container_width=True)
         st.divider()
-
-        try:
-            messages = call("GET", f"/chats/{cid}/messages")
-        except RuntimeError as e:
-            st.error(str(e))
-            return
 
         can_regen = (len(messages) >= 2 and messages[-1]["role"] == "assistant"
                      and messages[-2]["role"] == "user")
@@ -686,8 +752,10 @@ def page_mine():
     try:
         characters = call("GET", "/characters")
     except RuntimeError as e:
+        LOADER.empty()
         st.error(str(e))
         return
+    LOADER.empty()
     own = [c for c in characters if not c["is_builtin"]]
     if not own:
         st.info("You have not created any characters yet. Use the Create tab to make one.")
@@ -737,6 +805,7 @@ def page_mine():
 
 
 def page_create():
+    LOADER.empty()
     _, mid, _ = st.columns([1, 2.2, 1])
     with mid:
         st.markdown('<div class="section-title">Create a character</div>', unsafe_allow_html=True)
@@ -780,9 +849,25 @@ def page_create():
 # ---------------------------------------------------------------- router
 header()
 _page = st.session_state.nav or "Discover"
+_changed = st.session_state.get("_shown_page") != _page
+st.session_state._shown_page = _page
+_key = "page_" + _page.replace(" ", "_")
+
+# When you switch screens the old one is wiped at once and a small "Opening..." line shows while the new
+# screen is fetched. (Before, the old screen stayed on and looked frozen until the new one popped in.)
+BODY = st.empty().container(key=_key) if _changed else st.container(key=_key)
+with BODY:
+    LOADER = st.empty()
+    if _changed:
+        LOADER.markdown(f'<div class="vt-loading"><i></i>{LOADING_TEXT.get(_page, "Loading…")}</div>',
+                        unsafe_allow_html=True)
+if _changed and _page != "Chats":
+    run_js("const m=window.parent.document.querySelector('[data-testid=\"stMain\"]');"
+           "if(m){m.scrollTo({top:0,behavior:'instant'});}")
+
 if _page == "Chats":
-    page_chats()   # the chat box must stay at the root of the page, so this page fades in from inside
+    page_chats()   # the chat box must stay at the root of the page, so this page draws into BODY itself
 else:
-    # the key changes with the page, so Streamlit builds a new block and the fade-in plays once per switch
-    with st.container(key="page_" + _page.replace(" ", "_")):
+    with BODY:
         {"Discover": page_discover, "My Characters": page_mine, "Create": page_create}[_page]()
+        LOADER.empty()
