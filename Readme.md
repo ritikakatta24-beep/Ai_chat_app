@@ -158,7 +158,7 @@ In a second terminal:
 source venv/bin/activate
 API_URL=http://localhost:8000 streamlit run app.py
 ```
-Open http://localhost:8501, create an account and start chatting. Without `API_URL`, the front end connects to the author's hosted demo backend.
+Open http://localhost:8501, create an account and start chatting. Without `API_URL`, the front end connects to a backend on `http://localhost:8000`. To use a hosted backend, set `API_URL` to its address.
 
 ### Configuration
 
@@ -169,7 +169,7 @@ Open http://localhost:8501, create an account and start chatting. Without `API_U
 | `CHAT_MODEL` | Ollama model name | `qwen2.5:7b` |
 | `CONTEXT_MESSAGES` | Recent messages sent to the model | `20` (10 suggested on free tiers) |
 | `REASONING_EFFORT` | For gpt-oss models: low, medium or high | `low` |
-| `API_URL` | Backend address used by the front end | hosted demo URL |
+| `API_URL` | Backend address used by the front end | `http://localhost:8000` |
 
 The SQLite database (`app.db`) and the ChromaDB folder (`chroma_data/`) are created automatically on first run. The first chat may be slow while ChromaDB downloads its embedding model.
 
@@ -226,6 +226,18 @@ Notes:
 - The app looks for `characters_private.py` and character photos in `/etc/secrets`, so private cards never need to be committed.
 - On Render's free plan the service sleeps when idle, so the first request after a pause can take a while. The Streamlit front end pings the backend at startup to wake it.
 - The free plan has no persistent disk, so `app.db` and `chroma_data/` reset when the service restarts. That is fine for a demo. For real use, move to a persistent disk or a hosted database.
+
+## Results
+
+Small benchmarks I ran on the Groq-hosted setup (scripts in `benchmarks/`):
+
+| Test | Setup | Result |
+|---|---|---|
+| Streaming latency | 20 messages, Groq | 0.53 s average first token, 0.76 s full reply |
+| Fallback model | Primary model forced to fail, 20 messages | 20/20 answered, first token 0.84 s |
+| Long-term memory | 10 facts, each stated early and pushed outside a recent window of 4 messages | 9/10 recalled correctly |
+
+Notes: these are small tests on one network, not load tests. Memory recall was checked by looking for the key word in the reply. The fallback test used a wrong primary model name, so it simulates a failed model, not a full outage.
 
 ## Limitations and next steps
 
