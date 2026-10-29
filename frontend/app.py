@@ -32,7 +32,7 @@ span[data-testid="stIconMaterial"], [data-testid="stIconMaterial"] {
 .stApp { background: radial-gradient(1200px 600px at 50% -10%, #1d0d12 0%, #0b0809 60%); }
 #MainMenu, footer, header [data-testid="stToolbar"] { visibility: hidden; }
 [data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none; }
-.block-container { padding-top: 1.6rem; max-width: 1280px; }
+.block-container { padding-top: 4rem; max-width: 1280px; }
 
 .brand { font-family: 'Cormorant Garamond', serif; font-size: 2rem; font-weight: 700;
          color: #f1e6e3; letter-spacing: .5px; }
